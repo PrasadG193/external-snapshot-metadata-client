@@ -5,7 +5,7 @@ Sample client to interact with [external-snapshot-metadata](https://github.com/k
 ### Usage
 
 ```
-./external-snapshot-metadata-client --help
+$ ./external-snapshot-metadata-client --help
 Usage of ./external-snapshot-metadata-client:
   -base string
         base volume snapshot name
