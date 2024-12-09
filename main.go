@@ -44,10 +44,10 @@ func init() {
 }
 
 func main() {
-	var baseVolumeSnapshot, targetVolumeSnapshot, snapNamespace, clientSA, clientNamespace, mountedTokenPath string
+	var snapshot1, snapshot2, snapNamespace, clientSA, clientNamespace, mountedTokenPath string
 	var useMountedToken bool
-	flag.StringVar(&baseVolumeSnapshot, "base", "", "base volume snapshot name")
-	flag.StringVar(&targetVolumeSnapshot, "target", "", "target volume snapshot name")
+	flag.StringVar(&snapshot1, "snapshot-1", "", "first volume snapshot name")
+	flag.StringVar(&snapshot2, "snapshot-2", "", "second volume snapshot name")
 	flag.StringVar(&snapNamespace, "namespace", "default", "snapshot namespace")
 	flag.StringVar(&clientSA, "service-account", "default", "client service account")
 	flag.StringVar(&clientNamespace, "client-namespace", "default", "client namespace")
@@ -55,8 +55,8 @@ func main() {
 	flag.BoolVar(&useMountedToken, "use-projected-token", false, "Use token mounted using project volume instead of creating new with TokenRequest")
 	flag.Parse()
 
-	if baseVolumeSnapshot == "" || targetVolumeSnapshot == "" {
-		log.Fatal("base or target volumesnapshot is missing")
+	if snapshot1 == "" {
+		log.Fatal("atleast one snapshot is required")
 	}
 
 	//ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -65,8 +65,7 @@ func main() {
 	client := NewSnapshotMetadata()
 	snapMetadataSvc, saToken, err := client.setupSecurityAccess(
 		ctx,
-		baseVolumeSnapshot,
-		targetVolumeSnapshot,
+		snapshot1,
 		snapNamespace,
 		clientSA,
 		clientNamespace,
@@ -76,7 +75,14 @@ func main() {
 		log.Fatalf("could not get connection params %v", err)
 	}
 
-	if err := client.getChangedBlocks(ctx, snapMetadataSvc, baseVolumeSnapshot, targetVolumeSnapshot, saToken, snapNamespace); err != nil {
+	if snapshot2 == "" {
+		if err := client.getAllocatedBlocks(ctx, snapMetadataSvc, snapshot1, saToken, snapNamespace); err != nil {
+			log.Fatalf("could not get changed blocks %v", err)
+		}
+		return
+	}
+
+	if err := client.getChangedBlocks(ctx, snapMetadataSvc, snapshot1, snapshot2, saToken, snapNamespace); err != nil {
 		log.Fatalf("could not get changed blocks %v", err)
 	}
 }
@@ -166,8 +172,7 @@ func (c *Client) getSecurityToken(
 
 func (c *Client) setupSecurityAccess(
 	ctx context.Context,
-	baseSnap,
-	targetSnap,
+	snap1,
 	snapNamespace,
 	clientSA,
 	clientNamespace string,
@@ -177,7 +182,7 @@ func (c *Client) setupSecurityAccess(
 	// 1. Find Driver name for the snapshot
 	fmt.Printf("\n## Discovering SnapshotMetadataService for the driver and creating SA Token \n\n")
 	log.Print("Finding driver name for the snapshots")
-	_, driver, err := GetVolSnapshotInfo(ctx, c.rtCli, snapNamespace, baseSnap)
+	_, driver, err := GetVolSnapshotInfo(ctx, c.rtCli, snapNamespace, snap1)
 	if err != nil {
 		return nil, "", err
 	}
@@ -204,8 +209,8 @@ func (c *Client) setupSecurityAccess(
 func (c *Client) getChangedBlocks(
 	ctx context.Context,
 	snapMetaSvc *cbtv1alpha1.SnapshotMetadataService,
-	baseVolumeSnapshot,
-	targetVolumeSnapshot,
+	snapshot1,
+	snapshot2,
 	saToken,
 	snapNamespace string,
 ) error {
@@ -215,10 +220,57 @@ func (c *Client) getChangedBlocks(
 	stream, err := c.client.GetMetadataDelta(ctx, &pgrpc.GetMetadataDeltaRequest{
 		SecurityToken:      saToken,
 		Namespace:          snapNamespace,
-		BaseSnapshotName:   baseVolumeSnapshot,
-		TargetSnapshotName: targetVolumeSnapshot,
+		BaseSnapshotName:   snapshot1,
+		TargetSnapshotName: snapshot2,
 		StartingOffset:     0,
 		MaxResults:         int32(256),
+	})
+	if err != nil {
+		return err
+	}
+	done := make(chan bool)
+	fmt.Println("\n\n## Response received from external-snapshot-metadata service:")
+	go func() {
+		for {
+			resp, err := stream.Recv()
+			if err == io.EOF {
+				done <- true //means stream is finished
+				return
+			}
+			if err != nil {
+				log.Fatalf("cannot receive %v", err)
+			}
+			respJson, _ := protojson.Marshal(resp)
+			fmt.Println(string(respJson))
+			//fmt.Printf("%+v\n", resp)
+		}
+	}()
+
+	<-done //we will wait until all response is received
+	log.Printf("finished")
+	return nil
+}
+
+// Get allocated blocks metadata with GetAllocated rpc.
+// The security token needs to be created either using TokenRequest API or ProjectedToken fields in Pod spec
+// The token is used to in the req parameter which is used by the server to authenticate the client
+// Server auth at client side is done with CA Cert found in SnapshotMetadataService resource
+func (c *Client) getAllocatedBlocks(
+	ctx context.Context,
+	snapMetaSvc *cbtv1alpha1.SnapshotMetadataService,
+	snapshot1,
+	saToken,
+	snapNamespace string,
+) error {
+	fmt.Printf("\n## Making gRPC Call on %s endpoint to Get Changed Blocks Metadata...\n\n", snapMetaSvc.Spec.Address)
+
+	c.initGRPCClient(snapMetaSvc.Spec.CACert, snapMetaSvc.Spec.Address)
+	stream, err := c.client.GetMetadataAllocated(ctx, &pgrpc.GetMetadataAllocatedRequest{
+		SecurityToken:  saToken,
+		Namespace:      snapNamespace,
+		SnapshotName:   snapshot1,
+		StartingOffset: 0,
+		MaxResults:     int32(256),
 	})
 	if err != nil {
 		return err
